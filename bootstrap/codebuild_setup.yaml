@@ -105,6 +105,94 @@ Resources:
       Type: "String"
       Value: !Ref GitSSHPrivateKey
 
+####################################
+# CUSTOM RESOURCE TO TRIGGER CODEBUILD:
+####################################
+  MyTriggerCodeBuild:
+    Type: Custom::TriggerCodeBuild
+    Properties:
+      ServiceToken: !GetAtt TriggerCodeBuildLambda.Arn
+      ProjectName: !Ref CodeBuildProject
+
+# Custom resource to create/update/delete SSM securestring parameters
+  TriggerCodeBuildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.handler"
+      Runtime: python3.7
+      Timeout: 120
+      Role: !GetAtt TriggerCodeBuildLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import cfnresponse
+
+
+          codebuild_client = boto3.client('codebuild')
+
+          DEFAULT_LOGGING_LEVEL = logging.INFO
+          logging.basicConfig(format='[%(levelname)s] %(message)s', level=DEFAULT_LOGGING_LEVEL)
+          logger = logging.getLogger(__name__)
+          logger.setLevel(DEFAULT_LOGGING_LEVEL)
+
+          def start_build(resource_properties):
+              project_name = resource_properties.get('ProjectName')
+              if (not project_name):
+                  raise ValueError(
+                    'missing ProjectName resource property'
+                  )
+
+              response = codebuild_client.start_build(
+                  projectName=project_name
+              )
+              return response
+
+          def handler(event, context):
+              logger.info('event: {}'.format(json.dumps(event)))
+              request_type = event.get('RequestType')
+              resource_properties = event.get('ResourceProperties')
+
+              response = {}
+              response_status = cfnresponse.SUCCESS
+              request_id = ''
+              reason = ''
+
+              if (request_type in ['Create', 'Update']):
+                  try:
+                      start_build_response = start_build(resource_properties)
+                      logger.info(start_build_response)
+                      #'logger.info(
+                      #    'start_build response: {}'.format(
+                      #        json.dumps(start_build_response)
+                      #    )
+                      #)
+                      # only return specific fields to prevent "response object is too long" errors
+                      response = {
+                        'build_id':  start_build_response['build']['id'],
+                        'project_name':  start_build_response['build']['projectName'],
+                        'arn':  start_build_response['build']['arn'],
+                      }
+                      response_status = cfnresponse.SUCCESS
+                      request_id = start_build_response['ResponseMetadata']['RequestId']
+                      reason = 'Create'
+                  except Exception as e:
+                      error = 'failed to start build: {}'.format(e)
+                      logger.error(error)
+                      response_status = cfnresponse.FAILED
+                      reason = error
+                      pass
+
+              cfnresponse.send(
+                  event,
+                  context,
+                  response_status,
+                  response,
+                  request_id,
+                  reason
+              )
+
 
 ####################################
 # IAM:
@@ -124,6 +212,35 @@ Resources:
               - sts:AssumeRole
       ManagedPolicyArns:
         !Split [",", !Ref IAMCodeBuildPoliciesARNs]
+
+  TriggerCodeBuildLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - codebuild:StartBuild
+            Resource: !GetAtt CodeBuildProject.Arn
 
 
 ####################################
